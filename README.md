@@ -11,10 +11,11 @@ you ──photo──▶ bot ──▶ RAM ──AES-256-GCM──▶ vault.db (
                 │                        └─ plaintext zeroised
                 └──▶ channel: 26-px mosaic preview (irreversible)
 
-viewer taps "View 60s"  ─▶ photo sent, deleted after 60 s, no forwarding/saving
-viewer taps "Zero-knowledge" ─▶ https://host/v/<token>#<AES-key>
-                                browser fetches ciphertext, decrypts locally
-                                with WebCrypto; link works exactly once
+viewer taps "View once" ─▶ spoiler-covered photo, no saving/forwarding,
+                          deleted after 60 s
+viewer taps "One-time link" ─▶ https://host/v/<token>#<AES-key>
+                             browser fetches ciphertext, decrypts locally
+                             with WebCrypto; link works exactly once
 ```
 
 ## What is actually protected (honest trust model)
@@ -24,7 +25,7 @@ viewer taps "Zero-knowledge" ─▶ https://host/v/<token>#<AES-key>
 | Image at rest (`vault.db`, backups) | ✅ AES-256-GCM, per-image keys wrapped under an Argon2id key from your `MASTER_PASSPHRASE`. A stolen database is useless without the passphrase. |
 | Bot server memory | ✅ Plaintext exists only briefly in RAM and is zeroised. Never on disk, in logs, or in temp files. ⚠️ Python is a GC'd language — wiping is best-effort; see *Limitations*. |
 | Channel preview | ✅ 26-pixel mosaic + blur — the original detail no longer exists in the pixels, so it cannot be reversed. EXIF is stripped (fresh JPEG). |
-| `/get` in-chat photo | ⚠️ Decrypted in RAM, sent with `protect_content` (blocks forwarding/saving in clients) and deleted after 60 s. **Telegram's servers necessarily relay it in transit** — that is unavoidable for media sent inside Telegram. |
+| `/get` in-chat photo | ⚠️ Decrypted in RAM, sent with `protect_content` (blocks forwarding/saving in clients), covered by a tap-to-reveal spoiler, and deleted after 60 s. **True view-once media is impossible for bots** — the Bot API has no such parameter (verified against Bot API 9.x/10.x; the newer *Ephemeral Messages* are per-user group whispers, not view-once). **Telegram's servers necessarily relay the photo in transit** — that is unavoidable for media sent inside Telegram. |
 | `/secret` link | ✅ **Strongest mode.** The server serves ciphertext only. The AES key lives in the URL `#fragment`, which browsers never transmit. Decryption is 100% client-side (WebCrypto AES-GCM). Single use + expiry. |
 | Upload transit | ⚠️ Telegram is the transport for the initial upload, so Telegram sees the original there (no bot can avoid this). End-to-end-avoiding uploads would require client-side encryption before sending. |
 | Screen capture | ❌ No system on Earth stops a viewer from photographing their screen with a second device. Trust the recipient, not just the pipe. |
@@ -35,7 +36,7 @@ use `/secret` links only: for viewing, the server is ciphertext-blind.
 ## Quick start
 
 1. **Create the bot** — talk to [@BotFather](https://t.me/BotFather), `/newbot`, copy the token.
-2. **Create a (private) channel**, then in the channel: *Administrators → Add admin → your bot* (needs *Post messages*).
+2. **Create a (private) channel**, then in the channel: *Administrators → Add admin → your bot* (needs *Post messages*; being an admin also lets the bot check who has joined — that powers join-to-unlock access).
 3. **Deploy** on any VPS with Docker:
 
    ```bash
@@ -103,7 +104,7 @@ persistent disk, so you cannot lose a vault by accident without noticing.
 | Command | Action |
 |---|---|
 | send an image | seal it: encrypt → vault → channel preview |
-| `/get <id>` | decrypt in RAM, send photo, auto-delete after `VIEW_TTL_SECONDS` (60) |
+| `/get <id>` | view-once style: photo arrives spoiler-covered, saving/forwarding blocked, auto-deleted after `VIEW_TTL_SECONDS` (60) |
 | `/burn <id>` | same, then the ciphertext row is shredded forever |
 | `/secret <id>` | one-time link; decrypted in the viewer's browser |
 | `/list` | inventory (ids, sizes, dates) |
@@ -122,6 +123,8 @@ See [.env.example](.env.example). Highlights:
 | `MASTER_PASSPHRASE` | wraps all image keys via Argon2id — **lose it = lose the vault** |
 | `CHANNEL_ID` | `@channel` or `-100…` for previews |
 | `OWNER_ID` / `ALLOWED_USER_IDS` | who may unlock images |
+| `ALLOW_CHANNEL_MEMBERS` | `1` (default): **anyone who joined the channel can use the bot** — join-to-unlock, with a friendly "join the channel" hint for strangers. `0`: owner/whitelist only |
+| `SPOILER_ON_GET` | `1` (default): decrypted photos arrive under a tap-to-reveal spoiler (closest thing to view-once the Bot API offers) |
 | `BASE_URL` | HTTPS base for one-time links (enables `/secret`) |
 | `VIEW_TTL_SECONDS` / `LINK_TTL_SECONDS` | 60 s photo lifetime / 600 s link validity |
 

@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PIL import Image  # noqa: E402
 
 from crypto import CryptoError, VaultCrypto, b64url, new_salt  # noqa: E402
+from cryptography.exceptions import InvalidTag  # noqa: E402
 from db import Vault  # noqa: E402
 from preview import fallback_preview, make_mosaic  # noqa: E402
 from webapp import build_app  # noqa: E402
@@ -161,14 +162,13 @@ async def test_vault_and_links(vc, enc, preview_bytes):
         r = await cli.get(f"/v/{token}/data")
         assert r.status == 200
         j = await r.json()
-        assert set(j) == {"nonce", "ct", "mime"}
-        ok("ciphertext endpoint returns nonce+ct only")
+        assert set(j) == {"nonce", "ct", "aad", "mime"}
+        ok("ciphertext endpoint returns nonce+ct+aad only")
 
-        # server-side key never appears anywhere in the response
+        # server-side key never appears anywhere in the successful response
         dek = vc.unwrap_key(IMG_ID, row["wrap_nonce"], row["wrapped_key"])
-        body = await cli.get(f"/v/{token}/data")
-        assert b64url(bytes(dek)).encode() not in await body.read()
-        ok("AES key absent from every server response")
+        assert b64url(bytes(dek)) not in str(j)
+        ok("AES key absent from the server response")
 
         r = await cli.get(f"/v/{token}/data")
         assert r.status == 410
@@ -187,7 +187,8 @@ async def test_vault_and_links(vc, enc, preview_bytes):
         assert r.status == 410
         ok("unknown token -> 410 Gone")
 
-        # simulate what the browser does with the #fragment key
+        # simulate EXACTLY what the browser page does with the #fragment key
+        # (it passes j.aad through TextEncoder -> utf-8 as additionalData)
         import base64
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
         token3, _ = await vault.create_link(IMG_ID, 600)
@@ -196,9 +197,18 @@ async def test_vault_and_links(vc, enc, preview_bytes):
         pad = "=" * (-len(j["ct"]) % 4)
         ct = base64.urlsafe_b64decode(j["ct"] + pad)
         iv = base64.urlsafe_b64decode(j["nonce"] + pad)
-        pt = AESGCM(bytes(dek)).decrypt(iv, ct, IMG_ID.encode())
+
+        # regression for the reported browser "OperationError": decrypting
+        # WITHOUT additionalData (the old page behaviour) must fail
+        try:
+            AESGCM(bytes(dek)).decrypt(iv, ct, None)
+            raise AssertionError("decrypt without AAD unexpectedly succeeded")
+        except InvalidTag:
+            ok("regression: missing additionalData fails (the OperationError bug)")
+
+        pt = AESGCM(bytes(dek)).decrypt(iv, ct, j["aad"].encode("utf-8"))
         assert pt == PLAINTEXT
-        ok("browser-side simulation: WebCrypto inputs decrypt to the original")
+        ok("browser-side simulation (incl. AAD) decrypts to the original")
 
     # delete + wipe
     assert await vault.delete_image(IMG_ID) is True

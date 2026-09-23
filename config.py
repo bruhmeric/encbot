@@ -28,6 +28,12 @@ ALLOWED_USER_IDS: set[int] = {
     for x in os.getenv("ALLOWED_USER_IDS", "").replace(",", " ").split()
     if x.strip().isdigit()
 }
+# Join-to-unlock: when CHANNEL_ID is set, ANYONE who joined that channel may
+# use the bot (upload, request, view).  Set to 0 to restrict to owner/whitelist.
+# The bot must be an admin of the channel for the membership check to work
+# (it already has to be, to post previews).
+ALLOW_CHANNEL_MEMBERS: bool = os.getenv(
+    "ALLOW_CHANNEL_MEMBERS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # --- Crypto -----------------------------------------------------------------
 # Master passphrase.  NEVER stored anywhere.  An Argon2id key derived from it
@@ -46,6 +52,11 @@ BASE_URL: str = (os.getenv("BASE_URL", "").strip().rstrip("/")
 WEB_PORT: int = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
 LINK_TTL: int = int(os.getenv("LINK_TTL_SECONDS", "600"))   # link validity window
 VIEW_TTL: int = int(os.getenv("VIEW_TTL_SECONDS", "60"))    # in-chat photo lifetime
+# Cover the decrypted photo with a tap-to-reveal spoiler on /get (Telegram's
+# own view-once-style overlay; the photo still self-deletes after VIEW_TTL).
+# True view-once media is not available to bots via the Bot API.
+SPOILER_ON_GET: bool = os.getenv(
+    "SPOILER_ON_GET", "1").strip().lower() not in ("0", "false", "no", "off")
 
 # --- Storage ----------------------------------------------------------------
 DB_PATH: str = os.getenv("DB_PATH", "vault.db")

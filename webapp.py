@@ -6,7 +6,10 @@ How it stays zero-knowledge
 * Browsers NEVER send the URL fragment (#...) to the server - the AES key
   exists only in the user's browser and in the link itself.
 * ``GET /v/<token>``          -> static HTML shell (no secrets).
-* ``GET /v/<token>/data``     -> one-time JSON with ciphertext + nonce only.
+* ``GET /v/<token>/data``     -> one-time JSON with ciphertext, nonce and the
+  AAD (image id).  The page passes the AAD back as AES-GCM ``additionalData``
+  — the ciphertext is bound to it server-side, and omitting it is exactly
+  what produces a WebCrypto ``OperationError``.
   The claim is atomic (UPDATE ... WHERE link_used=0), so a second fetch gets
   410 Gone.  The server never decrypts anything for viewing.
 * The page decrypts with the browser's built-in WebCrypto (AES-GCM), shows
@@ -71,6 +74,9 @@ function b64uToBytes(s) {
   const img = document.getElementById('img');
   const frag = location.hash.slice(1);
   if (!frag) { status.textContent = '\u274c No key found in the URL fragment.'; return; }
+  if (!window.crypto || !crypto.subtle) {
+    status.textContent = '\u274c WebCrypto is unavailable \u2014 open this link over HTTPS.'; return;
+  }
   try {
     const keyBytes = b64uToBytes(frag);
     if (keyBytes.length !== 32) throw new Error('unexpected key length');
@@ -81,7 +87,10 @@ function b64uToBytes(s) {
     if (!r.ok) { status.textContent = '\u274c Fetch failed (' + r.status + ').'; return; }
     const j = await r.json();
     const pt = await crypto.subtle.decrypt(
-      {name: 'AES-GCM', iv: b64uToBytes(j.nonce)}, key, b64uToBytes(j.ct));
+      {name: 'AES-GCM',
+       iv: b64uToBytes(j.nonce),
+       additionalData: new TextEncoder().encode(j.aad)},
+      key, b64uToBytes(j.ct));
     const blob = new Blob([pt], {type: j.mime});
     const url = URL.createObjectURL(blob);
     img.src = url; img.hidden = false;
@@ -129,6 +138,7 @@ async def _data(request: web.Request) -> web.Response:
     return web.json_response({
         "nonce": b64url(row["nonce"]),
         "ct": b64url(row["ct"]),
+        "aad": row["id"],   # AES-GCM additional data the page must pass
         "mime": row["mime"],
     }, headers=NO_STORE)
 

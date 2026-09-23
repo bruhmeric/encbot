@@ -2,12 +2,13 @@
 
 Flow
 ----
-1. Owner sends an image to the bot in private chat.
+1. The owner (or any member of the preview channel) sends an image to the
+   bot in private chat.
 2. The bot downloads it straight into RAM, encrypts it with a fresh AES-256
    key (wrapped under an Argon2id-derived master key), stores ONLY ciphertext
    in SQLite and wipes plaintext from memory.
 3. A heavily pixelated, irreversible mosaic preview is posted to the channel
-   with "View (60s)" and "Zero-knowledge link" buttons.
+   with "View once (60s)" and "One-time link" buttons.
 4. On request:
      * View      -> decrypt in RAM, send as photo/document with
                     protect_content=True, auto-delete after VIEW_TTL seconds.
@@ -25,6 +26,7 @@ import asyncio
 import io
 import logging
 import secrets
+import time
 from datetime import datetime, timezone
 
 from aiohttp import web
@@ -52,8 +54,8 @@ WELCOME = (
     "Send me any image — I encrypt it with AES-256-GCM before it touches disk, "
     "post an irreversible blurred preview to the channel, and keep only ciphertext.\n\n"
     "<b>Commands</b>\n"
-    "• <code>/get &lt;id&gt;</code> — decrypt &amp; send, self-deletes in "
-    f"{config.VIEW_TTL}s\n"
+    "• <code>/get &lt;id&gt;</code> — view-once style: saving &amp; forwarding "
+    f"blocked, gone in {config.VIEW_TTL}s\n"
     "• <code>/secret &lt;id&gt;</code> — one-time link, decrypted in your <i>browser</i>\n"
     "• <code>/burn &lt;id&gt;</code> — view once, then shred the ciphertext\n"
     "• <code>/list</code> · <code>/delete &lt;id&gt;</code> · <code>/wipe</code>\n"
@@ -71,9 +73,12 @@ HELP = (
     "and is zeroised afterwards. It is never written to disk, logs or temp files.\n"
     "• <b>Channel</b>: previews are 26-pixel mosaics — the detail no longer exists "
     "in them, so they cannot be reversed.\n"
-    "• <b>/get</b>: the decrypted photo is sent with forward/save protection and "
-    f"deleted after {config.VIEW_TTL} seconds. Telegram's servers do relay it in "
-    "transit — that is unavoidable for in-chat media.\n"
+    "• <b>/get</b>: the closest a bot can get to view-once — Telegram's Bot API "
+    "does not let bots send true view-once media, so the photo arrives covered "
+    "by a tap-to-reveal spoiler, with saving/forwarding blocked "
+    f"(<code>protect_content</code>), and is deleted after {config.VIEW_TTL} "
+    "seconds. Telegram's servers do relay it in transit — that is unavoidable "
+    "for in-chat media.\n"
     "• <b>/secret</b>: the strongest mode. The server hands your browser ciphertext "
     "plus a key in the URL fragment (never transmitted). Decryption is 100% local "
     "via WebCrypto; the link works exactly once.\n\n"
@@ -83,14 +88,54 @@ HELP = (
 
 
 # --------------------------------------------------------------------------
+# access control
+# --------------------------------------------------------------------------
+
+_MEMBER_OK = {"creator", "administrator", "member"}
+_MEMBER_CACHE: dict[int, tuple[bool, float]] = {}
+_CACHE_TTL_OK = 300      # a confirmed member stays trusted for 5 min
+_CACHE_TTL_DENY = 60     # denials re-check after 1 min (user may have just joined)
+
+
+async def _is_channel_member(bot: Bot, user_id: int) -> bool:
+    """True if the user joined the preview channel (bot must be its admin)."""
+    if not config.CHANNEL_ID:
+        return False
+    now = time.monotonic()
+    hit = _MEMBER_CACHE.get(user_id)
+    if hit:
+        allowed, ts = hit
+        if now - ts < (_CACHE_TTL_OK if allowed else _CACHE_TTL_DENY):
+            return allowed
+    try:
+        member = await bot.get_chat_member(config.CHANNEL_ID, user_id)
+        allowed = member.status in _MEMBER_OK
+    except Exception as exc:
+        log.warning("membership check failed for %s: %s", user_id, exc)
+        allowed = False
+    _MEMBER_CACHE[user_id] = (allowed, now)
+    return allowed
+
+
+def _join_hint() -> str:
+    """Friendly denial that tells people how to unlock access."""
+    if config.ALLOW_CHANNEL_MEMBERS and config.CHANNEL_ID:
+        pretty = (config.CHANNEL_ID if config.CHANNEL_ID.startswith("@")
+                  else "the vault's channel")
+        return (f"🔒 This vault is for members of {pretty}.\n"
+                "Join the channel, then try again 🙌")
+    return "⛔ This vault is private."
+
+
+# --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
 
 def _kb(image_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"👁 View · {config.VIEW_TTL}s",
+        InlineKeyboardButton(text=f"👁 View once · {config.VIEW_TTL}s",
                              callback_data=f"get:{image_id}"),
-        InlineKeyboardButton(text="🕶 Zero-knowledge",
+        InlineKeyboardButton(text="🕶 One-time link",
                              callback_data=f"zk:{image_id}"),
     ]])
 
@@ -102,7 +147,7 @@ def _confirm_wipe_kb() -> InlineKeyboardMarkup:
     ]])
 
 
-async def _is_allowed(vault: Vault, user_id: int | None) -> bool:
+async def _is_allowed(bot: Bot, vault: Vault, user_id: int | None) -> bool:
     if not user_id:
         return False
     if config.OWNER_ID and user_id == config.OWNER_ID:
@@ -110,7 +155,12 @@ async def _is_allowed(vault: Vault, user_id: int | None) -> bool:
     if user_id in config.ALLOWED_USER_IDS:
         return True
     owner = await vault.get_meta("owner_id")
-    return bool(owner and int(owner) == user_id)
+    if owner and int(owner) == user_id:
+        return True
+    # join-to-unlock: anyone who joined the preview channel may use the bot
+    if config.ALLOW_CHANNEL_MEMBERS and config.CHANNEL_ID:
+        return await _is_channel_member(bot, user_id)
+    return False
 
 
 async def _try_claim_owner(vault: Vault, user_id: int | None) -> bool:
@@ -182,7 +232,8 @@ async def _deliver(bot: Bot, vault: Vault, crypto: VaultCrypto, chat_id: int,
         return f"❌ {exc}"
 
     caption = (f"🔓 #{image_id}" + (" · 🔥 burned after this view" if burn else "")
-               + f"\n⏳ vanishes in {config.VIEW_TTL}s")
+               + f"\n👁 one-time view — no saving, no forwarding · "
+                 f"vanishes in {config.VIEW_TTL}s")
     try:
         data = BufferedInputFile(bytes(pt), filename=row["filename"] or f"{image_id}.jpg")
         if row["as_doc"]:
@@ -190,7 +241,8 @@ async def _deliver(bot: Bot, vault: Vault, crypto: VaultCrypto, chat_id: int,
                                            caption=caption, protect_content=True)
         else:
             sent = await bot.send_photo(chat_id, photo=data,
-                                        caption=caption, protect_content=True)
+                                        caption=caption, protect_content=True,
+                                        has_spoiler=config.SPOILER_ON_GET)
     except Exception as exc:
         log.warning("delivery to %s failed: %s", chat_id, exc)
         return ("❌ Could not send you the file — open a private chat with me "
@@ -239,28 +291,28 @@ async def _send_zk_link(bot: Bot, vault: Vault, crypto: VaultCrypto,
 # --------------------------------------------------------------------------
 
 @router.message(CommandStart())
-async def cmd_start(m: Message, vault: Vault):
+async def cmd_start(m: Message, bot: Bot, vault: Vault):
     uid = m.from_user.id if m.from_user else None
-    if not await _is_allowed(vault, uid):
+    if not await _is_allowed(bot, vault, uid):
         if not config.OWNER_ID and await _try_claim_owner(vault, uid):
             pass  # first user just claimed ownership
         else:
-            return await m.reply("⛔ This vault is private.")
+            return await m.reply(_join_hint())
     await m.reply(WELCOME, parse_mode="HTML")
 
 
 @router.message(Command("help"))
-async def cmd_help(m: Message, vault: Vault):
-    if not await _is_allowed(vault, m.from_user.id if m.from_user else None):
-        return await m.reply("⛔ This vault is private.")
+async def cmd_help(m: Message, bot: Bot, vault: Vault):
+    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        return await m.reply(_join_hint())
     await m.reply(HELP, parse_mode="HTML")
 
 
 @router.message(F.photo | F.document)
 async def on_image(m: Message, bot: Bot, vault: Vault, crypto: VaultCrypto):
     uid = m.from_user.id if m.from_user else None
-    if not await _is_allowed(vault, uid):
-        return await m.reply("⛔ This vault is private.")
+    if not await _is_allowed(bot, vault, uid):
+        return await m.reply(_join_hint())
 
     # -- figure out what was sent ------------------------------------------
     if m.photo:
@@ -338,8 +390,8 @@ async def on_image(m: Message, bot: Bot, vault: Vault, crypto: VaultCrypto):
 @router.message(Command("get"))
 async def cmd_get(m: Message, command: CommandObject, bot: Bot,
                   vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(vault, m.from_user.id if m.from_user else None):
-        return await m.reply("⛔ This vault is private.")
+    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        return await m.reply(_join_hint())
     if not command.args:
         return await m.reply("Usage: <code>/get &lt;id&gt;</code>", parse_mode="HTML")
     res = await _deliver(bot, vault, crypto, m.chat.id, command.args.strip())
@@ -350,8 +402,8 @@ async def cmd_get(m: Message, command: CommandObject, bot: Bot,
 @router.message(Command("burn"))
 async def cmd_burn(m: Message, command: CommandObject, bot: Bot,
                    vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(vault, m.from_user.id if m.from_user else None):
-        return await m.reply("⛔ This vault is private.")
+    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        return await m.reply(_join_hint())
     if not command.args:
         return await m.reply("Usage: <code>/burn &lt;id&gt;</code>", parse_mode="HTML")
     res = await _deliver(bot, vault, crypto, m.chat.id, command.args.strip(), burn=True)
@@ -362,8 +414,8 @@ async def cmd_burn(m: Message, command: CommandObject, bot: Bot,
 @router.message(Command("secret"))
 async def cmd_secret(m: Message, command: CommandObject, bot: Bot,
                      vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(vault, m.from_user.id if m.from_user else None):
-        return await m.reply("⛔ This vault is private.")
+    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        return await m.reply(_join_hint())
     if not command.args:
         return await m.reply("Usage: <code>/secret &lt;id&gt;</code>", parse_mode="HTML")
     res = await _send_zk_link(bot, vault, crypto, m.chat.id, command.args.strip())
@@ -372,9 +424,9 @@ async def cmd_secret(m: Message, command: CommandObject, bot: Bot,
 
 
 @router.message(Command("list"))
-async def cmd_list(m: Message, vault: Vault):
-    if not await _is_allowed(vault, m.from_user.id if m.from_user else None):
-        return await m.reply("⛔ This vault is private.")
+async def cmd_list(m: Message, bot: Bot, vault: Vault):
+    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        return await m.reply(_join_hint())
     rows = await vault.list_images()
     if not rows:
         return await m.reply("🗂 The vault is empty. Send me an image to seal it.")
@@ -389,8 +441,8 @@ async def cmd_list(m: Message, vault: Vault):
 
 @router.message(Command("delete"))
 async def cmd_delete(m: Message, command: CommandObject, bot: Bot, vault: Vault):
-    if not await _is_allowed(vault, m.from_user.id if m.from_user else None):
-        return await m.reply("⛔ This vault is private.")
+    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        return await m.reply(_join_hint())
     if not command.args:
         return await m.reply("Usage: <code>/delete &lt;id&gt;</code>", parse_mode="HTML")
     image_id = command.args.strip()
@@ -403,9 +455,9 @@ async def cmd_delete(m: Message, command: CommandObject, bot: Bot, vault: Vault)
 
 
 @router.message(Command("wipe"))
-async def cmd_wipe(m: Message, vault: Vault):
-    if not await _is_allowed(vault, m.from_user.id if m.from_user else None):
-        return await m.reply("⛔ This vault is private.")
+async def cmd_wipe(m: Message, bot: Bot, vault: Vault):
+    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        return await m.reply(_join_hint())
     n = await vault.count()
     if n == 0:
         return await m.reply("🗂 Nothing to wipe.")
@@ -415,8 +467,8 @@ async def cmd_wipe(m: Message, vault: Vault):
 
 @router.message(Command("publish"))
 async def cmd_publish(m: Message, command: CommandObject, bot: Bot, vault: Vault):
-    if not await _is_allowed(vault, m.from_user.id if m.from_user else None):
-        return await m.reply("⛔ This vault is private.")
+    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        return await m.reply(_join_hint())
     if not command.args:
         return await m.reply("Usage: <code>/publish &lt;id&gt;</code>", parse_mode="HTML")
     image_id = command.args.strip()
@@ -432,8 +484,8 @@ async def cmd_publish(m: Message, command: CommandObject, bot: Bot, vault: Vault
 
 @router.message(Command("unpublish"))
 async def cmd_unpublish(m: Message, command: CommandObject, bot: Bot, vault: Vault):
-    if not await _is_allowed(vault, m.from_user.id if m.from_user else None):
-        return await m.reply("⛔ This vault is private.")
+    if not await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        return await m.reply(_join_hint())
     if not command.args:
         return await m.reply("Usage: <code>/unpublish &lt;id&gt;</code>", parse_mode="HTML")
     image_id = command.args.strip()
@@ -446,10 +498,13 @@ async def cmd_unpublish(m: Message, command: CommandObject, bot: Bot, vault: Vau
 
 
 @router.message()
-async def catch_all(m: Message):
-    await m.reply(
-        "🤖 Send me an image to seal it, or use /help.\n"
-        "List what is sealed with /list.")
+async def catch_all(m: Message, bot: Bot, vault: Vault):
+    if await _is_allowed(bot, vault, m.from_user.id if m.from_user else None):
+        await m.reply(
+            "🤖 Send me an image to seal it, or use /help.\n"
+            "List what is sealed with /list.")
+    else:
+        await m.reply(_join_hint())
 
 
 # --------------------------------------------------------------------------
@@ -458,8 +513,8 @@ async def catch_all(m: Message):
 
 @router.callback_query(F.data.startswith("get:"))
 async def cb_get(cq: CallbackQuery, bot: Bot, vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(vault, cq.from_user.id):
-        return await cq.answer("⛔ This vault is private.", show_alert=True)
+    if not await _is_allowed(bot, vault, cq.from_user.id):
+        return await cq.answer(_join_hint(), show_alert=True)
     image_id = cq.data.split(":", 1)[1]
     await cq.answer(f"🔓 Decrypting #{image_id}…")
     res = await _deliver(bot, vault, crypto, cq.from_user.id, image_id)
@@ -469,8 +524,8 @@ async def cb_get(cq: CallbackQuery, bot: Bot, vault: Vault, crypto: VaultCrypto)
 
 @router.callback_query(F.data.startswith("zk:"))
 async def cb_zk(cq: CallbackQuery, bot: Bot, vault: Vault, crypto: VaultCrypto):
-    if not await _is_allowed(vault, cq.from_user.id):
-        return await cq.answer("⛔ This vault is private.", show_alert=True)
+    if not await _is_allowed(bot, vault, cq.from_user.id):
+        return await cq.answer(_join_hint(), show_alert=True)
     image_id = cq.data.split(":", 1)[1]
     await cq.answer("🕶 Building a one-time link…")
     res = await _send_zk_link(bot, vault, crypto, cq.from_user.id, image_id)
@@ -480,8 +535,8 @@ async def cb_zk(cq: CallbackQuery, bot: Bot, vault: Vault, crypto: VaultCrypto):
 
 @router.callback_query(F.data == "wipeall:yes")
 async def cb_wipe_yes(cq: CallbackQuery, bot: Bot, vault: Vault):
-    if not await _is_allowed(vault, cq.from_user.id):
-        return await cq.answer("⛔ This vault is private.", show_alert=True)
+    if not await _is_allowed(bot, vault, cq.from_user.id):
+        return await cq.answer(_join_hint(), show_alert=True)
     for row in await vault.list_images(limit=1000):
         await _remove_channel_post(bot, vault, row)
     n = await vault.wipe_all()

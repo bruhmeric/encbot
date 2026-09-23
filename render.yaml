@@ -34,6 +34,10 @@ services:
       - key: ALLOWED_USER_IDS
         sync: false
       # ---- behaviour ----
+      - key: ALLOW_CHANNEL_MEMBERS
+        value: "1"
+      - key: SPOILER_ON_GET
+        value: "1"
       - key: VIEW_TTL_SECONDS
         value: "60"
       - key: LINK_TTL_SECONDS
